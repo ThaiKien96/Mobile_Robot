@@ -1,5 +1,4 @@
 /******************************************************************************
-<<<<<<< HEAD
  * #./Core/Src/rs485.c
  * 
  * Project:     LVTN
@@ -36,6 +35,12 @@ xorout=0x0000 check=0x29b1 residue=0x0000 name="CRC-16/CCITT-FALSE" */
 #define END_FRAME       0xff
 
 #define TX_TRY          3
+
+#define ACK_CODE        0x06
+#define NAK_CODE        0x15
+
+#define ACK_LEN         3
+#define NAK_LEN         3
 
 static unsigned char table[TABLE_SIZE];
 static int tx_flag = 0;
@@ -107,6 +112,7 @@ HAL_StatusTypeDef rs485_init(struct rs485_t * handler)
     }
 
 }
+
 HAL_StatusTypeDef rs485_send(struct rs485_t * handler, unsigned char * data, int data_len, int select)
 {
     HAL_StatusTypeDef ret = HAL_OK;
@@ -214,11 +220,19 @@ HAL_StatusTypeDef rs485_send(struct rs485_t * handler, unsigned char * data, int
             }
         }
 
+        for(int i = 0; i < ACK_LEN; i++)
+        {
+            if(handler->ack_buf[SRC_ID_LOC + 1 + i] != ACK_CODE)
+            {
+                goto ack_error;
+            }
+        }
+
         int crc = 0;
         ret = CRC_16(&crc, handler->ack_buf, handler->ack_size);
         if(ret != HAL_OK)
         {
-            return HAL_ERROR;
+            goto ack_error;
         }
         int crc_temp = (int)(((int)(handler->ack_buf[H_CRC_LOC(handler->ack_size)]) << 8) ||
                         ((int)(handler->ack_buf[L_CRC_LOC(handler->ack_size)]) & 0x00ff));
@@ -233,16 +247,142 @@ HAL_StatusTypeDef rs485_send(struct rs485_t * handler, unsigned char * data, int
         }
     }
 
+
+    free(buf);
     return HAL_OK;
 
 ack_error:
+    free(buf);
     return HAL_ERROR;
 }
 
 
 HAL_StatusTypeDef rs485_recv(struct rs485_t * handler, unsigned char * data, int data_len, int select)
 {
+    HAL_StatusTypeDef ret = HAL_OK;
+    unsigned char buf = (unsigned char*)malloc(handler->rx_size*sizeof(unsigned char));
 
+    ret = HAL_UART_Receive_IT(handler->huart, handler->rx_buf, handler->rx_size);
+    if(ret != HAL_OK)
+    {
+        goto recv_error;
+    }
+
+    memcpy(buf, handler->rx_buf, handler->rx_size);
+
+    // check source
+    if(buf[SRC_ID_LOC] == ID_SLAVE(1) || buf[SRC_ID_LOC] == ID_SLAVE(2))
+    {
+        ;
+    }
+    else
+    {
+        goto recv_finish;
+    }
+
+    //check destination
+    if(buf[DEST_ID_LOC] == ID_MASTER)
+    {
+        ;
+    }
+    else
+    {
+        goto recv_finish;
+    }
+
+    //add data length
+    if(buf[SRC_ID_LOC + 1] > (handler->rx_size - 6))
+    {
+        goto recv_error;
+    }
+
+    //check end byte
+    if(buf[handler->rx_size - 1] != END_FRAME)
+    {
+        goto recv_error;
+    }
+
+    //add data
+    {
+        int start_loc_data = SRC_ID_LOC + 2;
+        int end_loc_data   = SRC_ID_LOC + 2 + data_len;
+        for(int i = start_loc_data; i < end_loc_data; i++)
+        {
+            data[i - start_loc_data] = buf[i];
+        }
+    }
+
+    /* Send ACK/NAK */
+    {
+        /* Frame: |dest |scr    |len    |data   |pading(= 0)|crc(MSB)   |crc(LSB)   |end    | */
+
+        /* add ID */
+        buf[DEST_ID_LOC] = buf[SRC_ID_LOC];
+        buf[SRC_ID_LOC] = ID_MASTER;
+
+        /* add Data Length */
+        buf[SRC_ID_LOC + 1] = ACK_LEN;
+
+        /* add CRC */
+        int crc = 0;
+        ret = CRC_16(&crc,buf, handler->ack_size);
+        if(ret < 0)
+        {
+            return HAL_ERROR;
+        }
+        buf[H_CRC_LOC(handler->ack_size)] = (unsigned char)((crc & 0xff00) >> 8);
+        buf[L_CRC_LOC(handler->ack_size)] = (unsigned char)(crc & 0xff);
+
+        /* add data */
+        int start_loc_data = SRC_ID_LOC + 2;
+        int end_loc_data   = SRC_ID_LOC + 2 + ACK_LEN;
+        for(int i = start_loc_data; i < end_loc_data; i++)
+        {
+            buf[i] = ACK_CODE;
+        }
+
+        /*add pading */
+        for(int i = end_loc_data; i < H_CRC_LOC(handler->ack_size); i++)
+        {
+            buf[i] = 0;
+        }
+
+        /* add end byte */
+        buf[handler->ack_size - 1] = END_FRAME;
+    }
+
+    memcpy(handler->ack_buf, buf, handler->ack_size);
+
+    /* Send data */
+    {
+        int n_try = 1;
+
+        __HAL_LOCK(&handler->huart);
+        while((n_try <= TX_TRY))
+        {   
+            ret = HAL_UART_Transmit_IT(&handler->huart, handler->ack_buf, handler->ack_size);
+            if(ret != HAL_OK)
+            {
+                return HAL_ERROR;
+            }
+            HAL_Delay(2);
+            if(tx_flag == handler->tx_buf)
+            {
+                break;
+            }
+            n_try++;
+        }
+        __HAL_UNLOCK(&handler->huart);
+        tx_flag = 0; // clear flag
+    }
+
+recv_finish:
+    free(buf);
+    return HAL_OK;
+
+recv_error:
+    free(buf);
+    return HAL_ERROR;
 }
 static HAL_StatusTypeDef CRC_16(unsigned char *crc, unsigned char *data, int len)
 {
@@ -274,42 +414,3 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         rx_flag = 1;
     }
 }
-=======
-* #./Src/rs485.c
-* Project   :   LVTN
-* Module    :   rs485
-* Author    :   Le Thai Kien
-* Date      :   10/10/2018
-******************************************************************************/
-
-#include "rs485.h"
-
-rs485_error rs485_init(struct rs485_t * h ,UART_HandleTypeDef *uart)
-{
-    h->huart = uart;
-
-    memcpy(h->master.name,"STM32F407",10);
-    h->master.id = 0;
-
-    mencpy(h->slave[0].name,"STM32F411_Right",16);
-    h->slave[0].id = 10;
-
-    memcpy(h->slave[1].name,"STM32F411_Left",15);
-    h->slave[1].id = 11;
-
-    h->txbuf = (char*)calloc(TX_SIZE,sizeof(char));
-    h->tx_size = TX_SIZE;
-    h->tx_ack_size = ACK_SIZE;
-
-    h->rxbuf = (char*)calloc(RX_SIZE,sizeof(char));
-    h->rx_size = RX_SIZE;
-    h->rx_ack_size = ACK_SIZE;
-
-    h->status = NO_ERROR;
-} 
-static int crc_16(uint16_t crc, char * buf, int len);
-static rs485_error rs485_send(struct rs485_t * handler);
-static rs485_error rs485_recv(struct rs485_t * handler);
-static int  rs485_clear(struct rs485_t * handler);
-rs485_error rs485_transfer(struct rs485_t * handler);
->>>>>>> 0550c779061bbf42a3a8c8b64f8b62134534ea1e
